@@ -4,263 +4,138 @@
 #include <unistd.h>
 #include <time.h>
 #include <signal.h>
-#include <sys/inotify.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <string.h>
+#include <math.h>
 
-// Rule represents a binary string (array of integers)
+#define N 624
+#define M 397
+#define MATRIX_A 0x9908b0dfUL
+#define UPPER_MASK 0x80000000UL
+#define LOWER_MASK 0x7fffffffUL
+
+typedef struct {
+    unsigned long mt[N];  // The state vector
+    int mti;              // Index into mt[] for the next random value
+} gsl_rng;
+
+gsl_rng* gsl_rng_alloc() {
+    gsl_rng *rng = (gsl_rng*)malloc(sizeof(gsl_rng));
+    if (rng != NULL) {
+        rng->mt[0] = time(NULL);  // Seed with the current time
+        for (rng->mti = 1; rng->mti < N; rng->mti++) {
+            rng->mt[rng->mti] = (1812433253UL * (rng->mt[rng->mti-1] ^ (rng->mt[rng->mti-1] >> 30)) + rng->mti);
+            rng->mt[rng->mti] &= 0xffffffffUL;  // 32-bit integer
+        }
+    }
+    return rng;
+}
+
+void gsl_rng_free(gsl_rng *rng) {
+    if (rng != NULL) {
+        free(rng);
+    }
+}
+
+// Tempering function to extract a random value
+unsigned long gsl_rng_extract(gsl_rng *rng) {
+    unsigned long y;
+    unsigned long mag01[2] = {0x0UL, MATRIX_A};
+    if (rng->mti >= N) {
+        int kk;
+        for (kk = 0; kk < N - M; kk++) {
+            y = (rng->mt[kk] & UPPER_MASK) | (rng->mt[kk+1] & LOWER_MASK);
+            rng->mt[kk] = rng->mt[kk+M] ^ (y >> 1) ^ mag01[y & 0x1UL];
+        }
+        for (; kk < N - 1; kk++) {
+            y = (rng->mt[kk] & UPPER_MASK) | (rng->mt[kk+1] & LOWER_MASK);
+            rng->mt[kk] = rng->mt[kk+(M-N)] ^ (y >> 1) ^ mag01[y & 0x1UL];
+        }
+        y = (rng->mt[N-1] & UPPER_MASK) | (rng->mt[0] & LOWER_MASK);
+        rng->mt[N-1] = rng->mt[M-1] ^ (y >> 1) ^ mag01[y & 0x1UL];
+        rng->mti = 0;
+    }
+
+    y = rng->mt[rng->mti++];
+    y ^= (y >> 11);
+    y ^= (y << 7) & 0x9d2c5680UL;
+    y ^= (y << 15) & 0xefc60000UL;
+    y ^= (y >> 18);
+    
+    return y;
+}
+
+// Generate a random number between 0 and 1
+double gsl_rng_uniform(gsl_rng *rng) {
+    return (double)(gsl_rng_extract(rng) >> 5) * (1.0 / 9007199254740992.0);
+}
+
+// Define a simple rule struct
 typedef struct {
     int *rule;
     size_t size;
 } Rule;
 
-// FitnessTracker keeps track of a rule's fitness score
-typedef struct {
-    Rule rule;
-    int fitness;
-} FitnessTracker;
-
-// InstancedRuleDiscovery represents an instance of the rule discovery system
-typedef struct {
-    char *id;
-    Rule *rulePool;  // Separate data pool for each thread
-    size_t poolSize;
-    double mutationRate;
-    time_t lastChecked;
-} InstancedRuleDiscovery;
-
-// Shared memory pool for combining results
-typedef struct {
-    Rule *sharedMemory;
-    size_t poolSize;
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
-} SharedMemoryPool;
-
-// Global flag for graceful shutdown
-int running = 1;
-
-// Function prototypes
-Rule createRule(size_t size);
-void freeRule(Rule *rule);
-Rule mutate(Rule rule, double mutationRate);
-void *ruleDiscoveryLoop(void *arg);
-void *hotReloadWatch(void *arg);
-void handleGracefulShutdown(int sig);
-void combineResults(Rule mutatedRule, SharedMemoryPool *sharedPool);
-double getCpuLoad();
-double getGpuLoad();
-double adjustMutationRate(double baseRate, double elapsedTime);
-
-// Create a new rule
-Rule createRule(size_t size) {
-    Rule rule;
-    rule.size = size;
-    rule.rule = (int *)malloc(size * sizeof(int));
-    for (size_t i = 0; i < size; ++i) {
-        rule.rule[i] = rand() % 2; // Random binary rule
-    }
-    return rule;
-}
-
-// Free the memory allocated for a rule
-void freeRule(Rule *rule) {
-    if (rule && rule->rule) {
-        free(rule->rule);
-        rule->rule = NULL;
-        rule->size = 0;
-    }
-}
-
-// Perform mutation on a rule
-Rule mutate(Rule rule, double mutationRate) {
-    Rule mutated = createRule(rule.size);
+// Mutation function
+Rule mutate(Rule rule, double mutationRate, gsl_rng *rng) {
+    Rule mutated = { .size = rule.size, .rule = (int *)malloc(rule.size * sizeof(int)) };
     for (size_t i = 0; i < rule.size; ++i) {
         mutated.rule[i] = rule.rule[i];
-        if ((double)rand() / RAND_MAX < mutationRate) {
-            mutated.rule[i] = 1 - mutated.rule[i]; // Flip bit
+        double randomValue = gsl_rng_uniform(rng);  // Use inline RNG
+        if (randomValue < mutationRate) {
+            mutated.rule[i] = 1 - mutated.rule[i];  // Flip bit if mutation occurs
         }
     }
     return mutated;
 }
 
-// Simulate a fitness evaluation function (returns 1 for success, -1 for failure)
-int evaluateFitness(Rule rule) {
-    return rand() % 2 == 0 ? 1 : -1; // Random fitness evaluation
-}
-
-// Print a Socratic question
-void generateQuestion(Rule rule) {
-    printf("Does input pattern transformed by rule: [ ");
+// Function to print the rule
+void printRule(Rule rule) {
+    printf("[ ");
     for (size_t i = 0; i < rule.size; ++i) {
         printf("%d ", rule.rule[i]);
     }
-    printf("] yield the desired output?\n");
+    printf("]\n");
 }
 
-// Get current CPU load (using a system call or tool like `top` or `ps`)
-double getCpuLoad() {
-    // Placeholder for actual CPU load calculation (could use `top`, `sysctl`, etc.)
-    return 50.0;  // Simulated 50% CPU load
+// Example of fitness evaluation (random)
+int evaluateFitness(Rule rule) {
+    return rand() % 2 == 0 ? 1 : -1; // Random fitness evaluation (placeholder)
 }
 
-// Get current GPU load (using system tools like `nvidia-smi` or specific libraries)
-double getGpuLoad() {
-    // Placeholder for actual GPU load calculation (using `nvidia-smi`, CUDA, etc.)
-    return 60.0;  // Simulated 60% GPU load
-}
-
-// Generalized load calculation: average of CPU and GPU load
-double calculateLoadFactor() {
-    double cpuLoad = getCpuLoad();
-    double gpuLoad = getGpuLoad();
-    return (cpuLoad + gpuLoad) / 2.0;  // Averaging CPU and GPU load
-}
-
-// Adjust mutation rate based on load factor and elapsed time
-double adjustMutationRate(double baseRate, double elapsedTime) {
-    double loadFactor = calculateLoadFactor();  // Get the generalized load factor
-    double timeFactor = elapsedTime / 60.0;  // Time factor based on minutes
-
-    double adjustedRate = baseRate + (loadFactor * 0.1) + (timeFactor * 0.1);
-    if (adjustedRate > 1.0) {
-        adjustedRate = 1.0;
-    }
-    return adjustedRate;
-}
-
-// Combine the mutated result into the shared memory pool
-void combineResults(Rule mutatedRule, SharedMemoryPool *sharedPool) {
-    pthread_mutex_lock(&sharedPool->mutex);
-    // Ensure we don't overflow the shared memory pool
-    if (sharedPool->poolSize < 100) { // Assume 100 is the max size for simplicity
-        sharedPool->sharedMemory[sharedPool->poolSize++] = mutatedRule;
-    } else {
-        printf("Shared memory pool overflow!\n");
-    }
-    pthread_mutex_unlock(&sharedPool->mutex);
-}
-
-// Rule discovery loop function for each instance
-void *ruleDiscoveryLoop(void *arg) {
-    InstancedRuleDiscovery *instance = (InstancedRuleDiscovery *)arg;
-    time_t startTime = time(NULL);
-
-    // Initialize the data pool for this thread
-    Rule *localPool = instance->rulePool;
-    
-    while (running) {
-        double elapsedTime = difftime(time(NULL), startTime);
-        double mutationRate = adjustMutationRate(instance->mutationRate, elapsedTime);
-
-        for (size_t i = 0; i < instance->poolSize; ++i) {
-            Rule mutatedRule = mutate(localPool[i], mutationRate);
-
-            // Combine the mutated result into the shared memory pool
-            combineResults(mutatedRule, instance->rulePool);
-
-            // Simulate fitness check
-            if (evaluateFitness(mutatedRule) == -1) {
-                printf("Instance %s failed fitness check, resetting...\n", instance->id);
-                localPool[i] = createRule(localPool[i].size);  // Reset rule
-            }
-
-            freeRule(&mutatedRule);  // Free mutated rule memory
-        }
-
-        sleep(1);  // Simulate some processing time
-    }
-
-    pthread_exit(NULL);
-}
-
-// Watch for file changes (hot-reloading) using inotify
-void *hotReloadWatch(void *arg) {
-    char *configFile = (char *)arg;
-    int fd = inotify_init();
-    if (fd == -1) {
-        perror("inotify_init");
-        return NULL;
-    }
-
-    int wd = inotify_add_watch(fd, configFile, IN_MODIFY);
-    if (wd == -1) {
-        perror("inotify_add_watch");
-        return NULL;
-    }
-
-    char buffer[1024];
-    while (running) {
-        int length = read(fd, buffer, sizeof(buffer));
-        if (length == -1) {
-            perror("read");
-            break;
-        }
-
-        for (int i = 0; i < length; i += sizeof(struct inotify_event) + ((struct inotify_event *)&buffer[i])->len) {
-            struct inotify_event *event = (struct inotify_event *)&buffer[i];
-            if (event->mask & IN_MODIFY) {
-                printf("Config file modified, triggering reload...\n");
-                // Trigger reload logic here
-            }
-        }
-    }
-
-    close(fd);
-    pthread_exit(NULL);
-}
-
-// Graceful shutdown handler (SIGINT, SIGTERM)
-void handleGracefulShutdown(int sig) {
-    running = 0;  // Stop the running loop
-}
-
+// Main function demonstrating mutation
 int main() {
-    // Seed random number generator
-    srand(time(NULL));
+    srand(time(NULL));  // Initialize the random number generator
 
-    // Set up graceful shutdown handling
-    signal(SIGINT, handleGracefulShutdown);
-    signal(SIGTERM, handleGracefulShutdown);
-
-    // Shared memory pool setup
-    SharedMemoryPool sharedPool;
-    sharedPool.sharedMemory = (Rule *)malloc(100 * sizeof(Rule));  // Max 100 rules in shared pool
-    sharedPool.poolSize = 0;
-    pthread_mutex_init(&sharedPool.mutex, NULL);
-    pthread_cond_init(&sharedPool.cond, NULL);
-
-    // Initialize rule discovery instances
-    InstancedRuleDiscovery instance1 = {
-        .id = "instance1",
-        .rulePool = (Rule *)malloc(5 * sizeof(Rule)),  // 5 rules per pool
-        .poolSize = 5,
-        .mutationRate = 0.05,
-        .lastChecked = time(NULL)
-    };
-
-    for (size_t i = 0; i < instance1.poolSize; ++i) {
-        instance1.rulePool[i] = createRule(6);  // Create 6-bit rules
+    // Allocate and initialize RNG
+    gsl_rng *rng = gsl_rng_alloc();
+    if (rng == NULL) {
+        fprintf(stderr, "Failed to allocate RNG\n");
+        return -1;
     }
 
-    pthread_t discoveryThread;
-    pthread_create(&discoveryThread, NULL, ruleDiscoveryLoop, (void *)&instance1);
+    // Create a sample rule (6 bits)
+    Rule rule = { .size = 6, .rule = (int *)malloc(6 * sizeof(int)) };
+    for (size_t i = 0; i < 6; ++i) {
+        rule.rule[i] = rand() % 2;  // Initialize with random 0 or 1
+    }
 
-    pthread_t reloadThread;
-    pthread_create(&reloadThread, NULL, hotReloadWatch, (void *)"config.json");
+    printf("Original Rule: ");
+    printRule(rule);  // Print original rule
 
-    // Wait for threads to complete
-    pthread_join(discoveryThread, NULL);
-    pthread_join(reloadThread, NULL);
+    // Perform mutation with a rate of 0.05 (5% mutation chance)
+    double mutationRate = 0.05;
+    Rule mutatedRule = mutate(rule, mutationRate, rng);
 
-    // Clean up
-    free(instance1.rulePool);
-    free(sharedPool.sharedMemory);
-    pthread_mutex_destroy(&sharedPool.mutex);
-    pthread_cond_destroy(&sharedPool.cond);
+    printf("Mutated Rule: ");
+    printRule(mutatedRule);  // Print mutated rule
+
+    // Evaluate fitness of the mutated rule
+    int fitness = evaluateFitness(mutatedRule);
+    printf("Fitness of mutated rule: %d\n", fitness);
+
+    // Free memory
+    free(rule.rule);
+    free(mutatedRule.rule);
+    gsl_rng_free(rng);
 
     return 0;
 }
-
