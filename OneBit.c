@@ -74,12 +74,17 @@ typedef struct {
     size_t size;
 } Rule;
 
-// Mutation function
-Rule mutate(Rule rule, double mutationRate, gsl_rng *rng) {
+// Function to apply mutation with a dynamic rate based on stress level
+Rule mutate(Rule rule, double stressLevel, gsl_rng *rng) {
+    double mutationRate = fmin(0.05 * stressLevel, 0.2);  // Higher stress, higher mutation
     Rule mutated = { .size = rule.size, .rule = (int *)malloc(rule.size * sizeof(int)) };
+    if (mutated.rule == NULL) {
+        fprintf(stderr, "Memory allocation failed for mutated rule\n");
+        exit(1);  // Exit if memory allocation fails
+    }
     for (size_t i = 0; i < rule.size; ++i) {
         mutated.rule[i] = rule.rule[i];
-        double randomValue = gsl_rng_uniform(rng);  // Use inline RNG
+        double randomValue = gsl_rng_uniform(rng);
         if (randomValue < mutationRate) {
             mutated.rule[i] = 1 - mutated.rule[i];  // Flip bit if mutation occurs
         }
@@ -87,21 +92,23 @@ Rule mutate(Rule rule, double mutationRate, gsl_rng *rng) {
     return mutated;
 }
 
-// Function to print the rule
-void printRule(Rule rule) {
-    printf("[ ");
-    for (size_t i = 0; i < rule.size; ++i) {
-        printf("%d ", rule.rule[i]);
+// Crossover with higher exploration when stress level is high
+void crossover(Rule parent1, Rule parent2, Rule *child, double stressLevel, gsl_rng *rng) {
+    size_t crossoverPoint = rand() % parent1.size;
+    double crossoverRate = fmin(0.5 * stressLevel, 1.0);  // Higher stress encourages more crossover
+    for (size_t i = 0; i < parent1.size; ++i) {
+        if (i < crossoverPoint) {
+            child->rule[i] = parent1.rule[i];
+        } else {
+            child->rule[i] = parent2.rule[i];
+        }
+        // Additional randomization based on stress level
+        if (gsl_rng_uniform(rng) < crossoverRate) {
+            child->rule[i] = 1 - child->rule[i];  // Flip bit for exploration
+        }
     }
-    printf("]\n");
 }
 
-// Example of fitness evaluation (random)
-int evaluateFitness(Rule rule) {
-    return rand() % 2 == 0 ? 1 : -1; // Random fitness evaluation (placeholder)
-}
-
-// Main function demonstrating mutation
 int main() {
     srand(time(NULL));  // Initialize the random number generator
 
@@ -112,30 +119,57 @@ int main() {
         return -1;
     }
 
-    // Create a sample rule (6 bits)
-    Rule rule = { .size = 6, .rule = (int *)malloc(6 * sizeof(int)) };
-    for (size_t i = 0; i < 6; ++i) {
-        rule.rule[i] = rand() % 2;  // Initialize with random 0 or 1
+    // Create two parent rules (6 bits)
+    Rule parent1 = { .size = 6, .rule = (int *)malloc(6 * sizeof(int)) };
+    Rule parent2 = { .size = 6, .rule = (int *)malloc(6 * sizeof(int)) };
+    Rule child = { .size = 6, .rule = (int *)malloc(6 * sizeof(int)) };
+    if (parent1.rule == NULL || parent2.rule == NULL || child.rule == NULL) {
+        fprintf(stderr, "Memory allocation failed for rules\n");
+        gsl_rng_free(rng);
+        return -1;
     }
 
-    printf("Original Rule: ");
-    printRule(rule);  // Print original rule
+    // Initialize parent rules randomly
+    for (size_t i = 0; i < 6; ++i) {
+        parent1.rule[i] = rand() % 2;
+        parent2.rule[i] = rand() % 2;
+    }
 
-    // Perform mutation with a rate of 0.05 (5% mutation chance)
-    double mutationRate = 0.05;
-    Rule mutatedRule = mutate(rule, mutationRate, rng);
+    printf("Parent 1: ");
+    for (size_t i = 0; i < 6; ++i) {
+        printf("%d ", parent1.rule[i]);
+    }
+    printf("\n");
 
-    printf("Mutated Rule: ");
-    printRule(mutatedRule);  // Print mutated rule
+    printf("Parent 2: ");
+    for (size_t i = 0; i < 6; ++i) {
+        printf("%d ", parent2.rule[i]);
+    }
+    printf("\n");
 
-    // Evaluate fitness of the mutated rule
-    int fitness = evaluateFitness(mutatedRule);
-    printf("Fitness of mutated rule: %d\n", fitness);
+    // Perform crossover and mutation based on stress level
+    double stressLevel = 1.0;  // Can be adjusted dynamically
+    crossover(parent1, parent2, &child, stressLevel, rng);
 
-    // Free memory
-    free(rule.rule);
-    free(mutatedRule.rule);
+    printf("Child (after crossover): ");
+    for (size_t i = 0; i < 6; ++i) {
+        printf("%d ", child.rule[i]);
+    }
+    printf("\n");
+
+    Rule mutatedChild = mutate(child, stressLevel, rng);
+    printf("Mutated Child: ");
+    for (size_t i = 0; i < 6; ++i) {
+        printf("%d ", mutatedChild.rule[i]);
+    }
+    printf("\n");
+
     gsl_rng_free(rng);
+    free(parent1.rule);
+    free(parent2.rule);
+    free(child.rule);
+    free(mutatedChild.rule);
 
     return 0;
 }
+
